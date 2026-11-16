@@ -16,7 +16,7 @@ impl TreeLensApp {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("筛选名称…"));
         let subscriptions = vec![
             cx.subscribe_in(&path_input, window, |this, state, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+                if matches!(event, InputEvent::PressEnter { .. }) && !window.has_active_dialog(cx) {
                     let value = state.read(cx).value().to_string();
                     if !value.trim().is_empty() {
                         this.start(expand_home(&value), window, cx);
@@ -66,6 +66,7 @@ impl TreeLensApp {
             deletion_notice: None,
             deletion_progress: None,
             deletion_mode: None,
+            reconcile_after_deletion: false,
             delete_operation: DeletionRequest::execute,
         };
         if let Some(path) = initial {
@@ -91,6 +92,9 @@ impl TreeLensApp {
             return;
         }
         self.generation = self.generation.wrapping_add(1);
+        // This request happened after the worker completed (if a revalidation
+        // was pending), so its scan does not need to be repeated.
+        self.reconcile_after_deletion = false;
         self.path_input.update(cx, |input, cx| {
             input.set_value(path.display().to_string(), window, cx)
         });
@@ -189,6 +193,10 @@ impl TreeLensApp {
         }
         if query_changed {
             self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
+        if self.reconcile_after_deletion && !self.session.busy() {
+            self.reconcile_after_deletion = false;
+            self.revalidate_current_view_after_deletion();
         }
         cx.notify();
     }
@@ -304,17 +312,17 @@ impl TreeLensApp {
         cx.notify();
     }
 
-    /// Scanning another root is interruptible; deletion and its reconciliation
-    /// are not. These guards also protect native picker/keyboard/drop entry points.
+    /// Guard the unconfirmed request, not the app: after confirmation the
+    /// deletion worker owns an independent snapshot of the target.
     pub(super) fn navigation_blocked(&self) -> bool {
-        self.deletion.is_some()
-            || self.preparing_deletion.is_some()
-            || self.pending_deletion.is_some()
-            || self.session.reconciling()
+        self.preparing_deletion.is_some() || self.pending_deletion.is_some()
     }
 
     pub(super) fn busy(&self) -> bool {
-        self.session.busy() || self.deletion.is_some() || self.preparing_deletion.is_some()
+        self.session.busy()
+            || self.deletion.is_some()
+            || self.preparing_deletion.is_some()
+            || self.reconcile_after_deletion
     }
 
     pub(super) fn deletable_item(&self, id: NodeId, _mode: DeletionMode) -> bool {
@@ -691,7 +699,30 @@ impl TreeLensApp {
         // All outcomes can have changed disk state, including partial Trash or
         // permanent failures. Revalidate accounting read-only in the background,
         // never clear the displayed tree or reuse a stale subtraction estimate.
-        self.session.reconcile();
+        if self.session.busy() {
+            // A read-only scan started during deletion may have seen a mix of
+            // old and new entries. Revalidate the latest view after it settles;
+            // never restore the root that originally started the deletion.
+            self.reconcile_after_deletion = true;
+        } else {
+            self.revalidate_current_view_after_deletion();
+        }
         cx.notify();
+    }
+
+    fn revalidate_current_view_after_deletion(&mut self) {
+        if !self.session.stale() {
+            if self
+                .session
+                .result
+                .as_ref()
+                .is_some_and(|scan| scan.cancelled)
+            {
+                // Respect Cancel rather than silently starting another scan.
+                self.session.retain_stale_after_deletion();
+            } else {
+                self.session.reconcile();
+            }
+        }
     }
 }

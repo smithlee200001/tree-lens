@@ -323,7 +323,6 @@ fn reconciliation_retains_view_then_maps_navigation_and_external_changes() {
     assert_eq!(session.summary(), old_summary);
     assert_eq!(session.rows.len(), old_rows);
     assert_eq!(session.selected, old_selected);
-    assert!(!session.start(fixture.0.join("other")));
     assert!(!session.refresh());
     assert!(!session.reconcile());
     finish(&mut session);
