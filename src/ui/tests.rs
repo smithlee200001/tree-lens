@@ -272,6 +272,7 @@ fn deletion_confirmation_is_single_use_and_refreshes_selection(cx: &mut TestAppC
         view.update(cx, |app, cx| {
             assert!(app.pending_deletion.is_none());
             assert!(app.deletion.is_some());
+            assert!(app.deletion_progress.is_some());
             app.show_dialog(false, window, cx);
             assert!(!window.has_active_dialog(cx));
             app.confirm_delete(window, cx); // repeated dispatch must do nothing
@@ -285,6 +286,7 @@ fn deletion_confirmation_is_single_use_and_refreshes_selection(cx: &mut TestAppC
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(app.session.selected, Some(scan.root));
             assert_eq!(scan.nodes.len(), 1);
@@ -531,6 +533,7 @@ fn permanent_confirmation_is_single_use_and_refreshes_file_counts(cx: &mut TestA
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(
                 scan.path_for(app.session.selected.unwrap()),
@@ -598,6 +601,7 @@ fn file_trash_success_preserves_recoverable_content_and_refreshes(cx: &mut TestA
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(scan.nodes[scan.root].file_count, 0);
             assert_eq!(
@@ -665,6 +669,7 @@ fn folder_permanent_warning_cancel_and_recursive_confirmation(cx: &mut TestAppCo
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(scan.nodes.len(), 1);
             assert_eq!(app.session.selected, Some(scan.root));
@@ -813,6 +818,7 @@ fn deletion_keeps_list_mounted_and_preserves_viewport_and_navigation(cx: &mut Te
             }
             let app = view.read(cx);
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(scan.nodes[scan.root].file_count, 80);
             assert_eq!(
@@ -1071,6 +1077,7 @@ fn partial_permanent_failure_refreshes_and_does_not_retry(cx: &mut TestAppContex
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!app.busy());
+            assert!(app.deletion_progress.is_none());
             let scan = app.session.result.as_ref().unwrap();
             assert_eq!(scan.nodes[scan.root].file_count, 0);
             assert_eq!(scan.nodes.len(), 2);
@@ -1091,4 +1098,40 @@ fn partial_permanent_failure_refreshes_and_does_not_retry(cx: &mut TestAppContex
     .unwrap();
     assert!(temp.0.join("scan/folder-to-trash").is_dir());
     assert!(!temp.0.join("scan/folder-to-trash/content.txt").exists());
+}
+
+#[gpui_kit::test]
+fn progress_panel_is_visible_without_moving_explorer(cx: &mut TestAppContext) {
+    let (handle, view) = fixture(cx, 1080.0, true);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let root_bounds = window.find("displayed-root").bounds();
+        let refresh_bounds = window.find("refresh").bounds();
+        view.update(cx, |app, cx| app.preview_deletion_progress(cx));
+        window.render_frame(cx);
+        assert!(window.find("deletion-progress").visible());
+        assert!(window.find("deletion-progress-path").visible());
+        assert!(window.find("deletion-progress").bounds().bottom() < px(760.0));
+        assert_eq!(window.find("displayed-root").bounds(), root_bounds);
+        assert_eq!(window.find("refresh").bounds(), refresh_bounds);
+        assert!(!window.has_active_dialog(cx));
+        let progress = view.read(cx).deletion_progress.clone().unwrap();
+        progress.update(cx, |state, cx| {
+            let handle = state.handle.clone();
+            let guard = handle.lock().unwrap();
+            // Holding the mailbox must not block the UI poll.
+            state.poll(cx);
+            drop(guard);
+            state.handle.lock().unwrap().completed = 2048;
+            state.poll(cx);
+            assert_eq!(state.snapshot.completed, 2048);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("displayed-root").bounds(), root_bounds);
+        assert!(
+            view.read(cx).deletion.is_none(),
+            "preview never starts deletion"
+        );
+    })
+    .unwrap();
 }

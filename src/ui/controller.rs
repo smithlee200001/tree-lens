@@ -64,6 +64,7 @@ impl TreeLensApp {
             preparing_deletion: None,
             deletion: None,
             deletion_notice: None,
+            deletion_progress: None,
             deletion_mode: None,
             delete_operation: DeletionRequest::execute,
         };
@@ -598,8 +599,27 @@ impl TreeLensApp {
         }
     }
 
+    /// Render-only synthetic progress. Never starts a deletion worker.
+    #[cfg(feature = "ui-tests")]
+    pub fn preview_deletion_progress(&mut self, cx: &mut Context<Self>) {
+        use crate::features::delete::{DeletionPhase, DeletionProgress};
+        let snapshot = DeletionProgress {
+            phase: DeletionPhase::Removing,
+            completed: 1280,
+            total: Some(4096),
+        };
+        self.deletion_progress = Some(cx.new(|_| DeletionProgressView {
+            handle: Arc::new(std::sync::Mutex::new(snapshot.clone())),
+            snapshot,
+            path: "/示例目录/待删除的大文件夹（合成预览，不执行删除）".into(),
+            started: std::time::Instant::now(),
+            elapsed: 0,
+        }));
+        cx.notify();
+    }
+
     pub(super) fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((generation, request)) = self.pending_deletion.take() else {
+        let Some((generation, mut request)) = self.pending_deletion.take() else {
             return;
         };
         window.close_dialog(cx);
@@ -609,6 +629,9 @@ impl TreeLensApp {
             return;
         }
         let mode = request.mode();
+        let progress = request.track_progress();
+        let snapshot = progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let path = request.path().display().to_string();
         let operation = self.delete_operation;
         let (sender, receiver) = mpsc::sync_channel(1);
         match std::thread::Builder::new()
@@ -618,6 +641,13 @@ impl TreeLensApp {
             }) {
             Ok(_) => {
                 self.deletion = Some(receiver);
+                self.deletion_progress = Some(cx.new(|_| DeletionProgressView {
+                    handle: progress,
+                    snapshot,
+                    path,
+                    started: std::time::Instant::now(),
+                    elapsed: 0,
+                }));
                 self.deletion_mode = Some(mode);
                 self.deletion_notice = None;
                 self.session.status = "正在处理删除…请勿移动或重命名此项目。".into();
@@ -628,6 +658,9 @@ impl TreeLensApp {
     }
 
     pub(super) fn poll_deletion(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(progress) = &self.deletion_progress {
+            progress.update(cx, |view, cx| view.poll(cx));
+        }
         let result = match self.deletion.as_ref().map(|receiver| receiver.try_recv()) {
             Some(Ok(result)) => result,
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -635,14 +668,25 @@ impl TreeLensApp {
             }
             _ => return,
         };
+        let partial_progress = self.deletion_progress.as_ref().and_then(|view| {
+            let view = view.read(cx);
+            let progress = view.handle.lock().unwrap_or_else(|e| e.into_inner());
+            progress
+                .total
+                .map(|total| format!("已删除 {} / {total} 项。", progress.completed))
+        });
         self.deletion = None;
+        self.deletion_progress = None;
         let mode = self.deletion_mode.take().unwrap_or(DeletionMode::Trash);
         self.deletion_notice = Some(match result {
             Ok(()) => match mode {
                 DeletionMode::Trash => format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复"),
                 DeletionMode::Permanent => "已彻底删除所选项目；此操作不可撤销".into(),
             },
-            Err(error) => format!("未能确认删除完成：{error} 不会自动重试。"),
+            Err(error) => format!(
+                "未能确认删除完成：{error} {}不会自动重试。",
+                partial_progress.unwrap_or_default()
+            ),
         });
         // All outcomes can have changed disk state, including partial Trash or
         // permanent failures. Revalidate accounting read-only in the background,
