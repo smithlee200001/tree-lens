@@ -10,6 +10,7 @@ use crate::features::scan::{NodeId, NodeKind, ScanOutcome};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::platform::delete::{
     self as platform, directory_identity, entry_identity, move_to_trash, Identity,
@@ -24,6 +25,23 @@ pub enum DeletionMode {
     Permanent,
 }
 
+/// Latest-only progress; no queued event per file and no extra directory scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionProgress {
+    pub phase: DeletionPhase,
+    pub completed: usize,
+    pub total: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionPhase {
+    Validating,
+    Removing,
+    MovingToTrash,
+}
+
+pub type DeletionProgressHandle = Arc<Mutex<DeletionProgress>>;
+
 /// A single-use confirmation snapshot. Construct when opening the confirmation
 /// dialog, keep its path visible, then consume it only after explicit confirmation.
 #[derive(Debug)]
@@ -34,6 +52,7 @@ pub struct DeletionRequest {
     identities: Vec<(PathBuf, Identity)>,
     mode: DeletionMode,
     subtree: Option<Subtree>,
+    progress: Option<DeletionProgressHandle>,
 }
 
 impl DeletionRequest {
@@ -138,6 +157,7 @@ impl DeletionRequest {
             identities,
             mode,
             subtree: None,
+            progress: None,
         };
         request.revalidate()?;
         Ok(request)
@@ -195,6 +215,29 @@ impl DeletionRequest {
         Ok(())
     }
 
+    /// Observe the existing validated removal loop without changing deletion semantics.
+    pub fn track_progress(&mut self) -> DeletionProgressHandle {
+        let progress = Arc::new(Mutex::new(DeletionProgress {
+            phase: DeletionPhase::Validating,
+            completed: 0,
+            total: if self.mode == DeletionMode::Permanent {
+                Some(self.subtree.as_ref().map_or(1, Subtree::len))
+            } else {
+                None
+            },
+        }));
+        self.progress = Some(Arc::clone(&progress));
+        progress
+    }
+
+    fn report_progress(&self, phase: DeletionPhase, completed: usize) {
+        if let Some(progress) = &self.progress {
+            let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+            progress.phase = phase;
+            progress.completed = completed;
+        }
+    }
+
     pub fn execute(self) -> Result<(), String> {
         match self.mode {
             DeletionMode::Trash => self.execute_with(move_to_trash),
@@ -211,7 +254,8 @@ impl DeletionRequest {
                     }
                     // Never recursively sweep a live directory: remove exactly
                     // the confirmed entries. New children make remove_dir fail.
-                    for (path, expected) in subtree.iter().rev() {
+                    self.report_progress(DeletionPhase::Removing, 0);
+                    for (index, (path, expected)) in subtree.iter().rev().enumerate() {
                         let remove = || -> Result<(), String> {
                             self.revalidate()?;
                             for ancestor in path
@@ -238,6 +282,7 @@ impl DeletionRequest {
                         remove().map_err(|error| {
                             format!("彻底删除中止：{error}。部分已确认项目可能已删除，请重新扫描。")
                         })?;
+                        self.report_progress(DeletionPhase::Removing, index + 1);
                     }
                     Ok(())
                 } else {
@@ -248,7 +293,11 @@ impl DeletionRequest {
                     {
                         return Err("文件夹尚未完成内容检查，已取消彻底删除。".into());
                     }
-                    fs::remove_file(&self.path).map_err(|error| format!("彻底删除失败：{error}"))
+                    self.report_progress(DeletionPhase::Removing, 0);
+                    fs::remove_file(&self.path)
+                        .map_err(|error| format!("彻底删除失败：{error}"))?;
+                    self.report_progress(DeletionPhase::Removing, 1);
+                    Ok(())
                 }
             }
         }
@@ -259,6 +308,7 @@ impl DeletionRequest {
             return Err("确认的删除方式与回收站操作不一致。".into());
         }
         self.revalidate()?;
+        self.report_progress(DeletionPhase::MovingToTrash, 0);
         trash(&self.path)
     }
 }

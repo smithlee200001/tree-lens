@@ -773,3 +773,56 @@ fn unsupported_platform_keeps_folder() {
     assert!(fixture.request().execute().is_err());
     assert!(fixture.0.join("parent/child").is_dir());
 }
+
+#[test]
+fn permanent_progress_counts_confirmed_entries_including_root() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("parent/child/a"), b"progress fixture").unwrap();
+    fs::create_dir(fixture.0.join("parent/child/nested")).unwrap();
+    fs::write(fixture.0.join("parent/child/nested/b"), b"fixture").unwrap();
+    let scan = fixture.scan();
+    let mut request =
+        DeletionRequest::prepare_with_mode(&scan, id(&scan, "child"), DeletionMode::Permanent)
+            .unwrap();
+    let progress = request.track_progress();
+    assert_eq!(progress.lock().unwrap().total, Some(4));
+    assert_eq!(progress.lock().unwrap().phase, DeletionPhase::Validating);
+    request.execute().unwrap();
+    let progress = progress.lock().unwrap();
+    assert_eq!(progress.phase, DeletionPhase::Removing);
+    assert_eq!(progress.completed, 4);
+    assert!(!fixture.0.join("parent/child").exists());
+    assert!(fixture.0.join("file").is_file());
+}
+
+#[test]
+fn changed_contents_never_report_deleted_progress() {
+    let fixture = Fixture::new();
+    let scan = fixture.scan();
+    let mut request =
+        DeletionRequest::prepare_with_mode(&scan, id(&scan, "child"), DeletionMode::Permanent)
+            .unwrap();
+    let progress = request.track_progress();
+    fs::write(fixture.0.join("parent/child/new"), b"unconfirmed").unwrap();
+    assert!(request.execute().is_err());
+    assert_eq!(progress.lock().unwrap().completed, 0);
+    assert_eq!(progress.lock().unwrap().phase, DeletionPhase::Validating);
+    assert!(fixture.0.join("parent/child/new").is_file());
+}
+
+#[test]
+fn trash_progress_has_no_invented_total_and_failure_keeps_target() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request();
+    let progress = request.track_progress();
+    let observed = Arc::clone(&progress);
+    assert!(request
+        .execute_with(|_| {
+            assert_eq!(observed.lock().unwrap().phase, DeletionPhase::MovingToTrash);
+            Err("synthetic trash failure".into())
+        })
+        .is_err());
+    assert_eq!(progress.lock().unwrap().total, None);
+    assert_eq!(progress.lock().unwrap().completed, 0);
+    assert!(fixture.0.join("parent/child").is_dir());
+}

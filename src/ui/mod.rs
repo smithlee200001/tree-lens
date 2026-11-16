@@ -1,6 +1,8 @@
 //! Native GPUI presentation shared by the desktop entry point and snapshots.
 //! Feature state lives in `features`; OS integrations live in `platform`.
 mod controller;
+mod deletion_progress;
+use deletion_progress::DeletionProgressView;
 #[cfg(all(test, feature = "ui-tests"))]
 mod flicker_tests;
 #[cfg(all(test, feature = "ui-tests"))]
@@ -83,6 +85,7 @@ pub struct TreeLensApp {
     preparing_deletion: Option<DeletionPreparation>,
     deletion: Option<mpsc::Receiver<Result<(), String>>>,
     deletion_notice: Option<String>,
+    deletion_progress: Option<Entity<DeletionProgressView>>,
     deletion_mode: Option<DeletionMode>,
     delete_operation: fn(DeletionRequest) -> Result<(), String>,
 }
@@ -1403,6 +1406,16 @@ impl Render for TreeLensApp {
                     ),
             )
             .child(self.status_bar(cx))
+            .when_some(self.deletion_progress.clone(), |el, progress| {
+                el.child(
+                    div()
+                        .absolute()
+                        .right(px(20.0))
+                        .bottom(px(48.0))
+                        .w(px(440.0))
+                        .child(progress),
+                )
+            })
     }
 }
 

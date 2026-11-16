@@ -60,7 +60,9 @@ fn main() -> Result<()> {
     if let Some(preview) = preview {
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |app, cx| {
-                if preview == "--delete-dialog" {
+                if preview == "--delete-progress" {
+                    app.preview_deletion_progress(cx);
+                } else if preview == "--delete-dialog" {
                     app.preview_delete_confirmation(window, cx);
                 } else if preview == "--file-trash-dialog" {
                     app.preview_file_deletion(
