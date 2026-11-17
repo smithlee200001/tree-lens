@@ -87,6 +87,7 @@ pub struct TreeLensApp {
     deletion_notice: Option<String>,
     deletion_progress: Option<Entity<DeletionProgressView>>,
     deletion_mode: Option<DeletionMode>,
+    reconcile_after_deletion: bool,
     delete_operation: fn(DeletionRequest) -> Result<(), String>,
 }
 
@@ -219,7 +220,6 @@ impl TreeLensApp {
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let busy = self.busy();
         let navigation_blocked = self.navigation_blocked() || self.choosing;
         div()
             .flex()
@@ -282,8 +282,8 @@ impl TreeLensApp {
                     .child(
                         div().flex_1().min_w_0().child(
                             Input::new(&self.path_input)
-                                // Read-only keeps text/copying stable during deletion;
-                                // ordinary scans can be replaced by a new path.
+                                // Only preparation/confirmation locks navigation.
+                                // An executing deletion owns its confirmed path.
                                 .readonly(navigation_blocked)
                                 .aria_label("扫描文件夹路径"),
                         ),
@@ -318,8 +318,8 @@ impl TreeLensApp {
                             .w(px(80.0))
                             .icon(IconName::RotateCw)
                             .tooltip(desktop::REFRESH_TOOLTIP)
-                            .disabled(busy || self.session.root_path.is_none())
-                            .when(busy, stable_navigation_button)
+                            .disabled(navigation_blocked || self.session.root_path.is_none())
+                            .when(navigation_blocked, stable_navigation_button)
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx)))
                     }),
             )
@@ -565,6 +565,7 @@ impl TreeLensApp {
                             .child(
                                 div().w(px(190.0)).child(
                                     Input::new(&self.search_input)
+                                        .id("tree-filter")
                                         .small()
                                         .cleanable(true)
                                         .prefix(Icon::new(IconName::Search).size_4())
@@ -1235,7 +1236,7 @@ impl TreeLensApp {
             .when(issue_count > 0, |el| {
                 el.child(
                     Button::new("issues")
-                        .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
+                        .disabled(self.preparing_deletion.is_some())
                         .text_color(rgb(TEXT))
                         .ghost()
                         .xsmall()
@@ -1247,7 +1248,7 @@ impl TreeLensApp {
             })
             .child(
                 Button::new("about")
-                    .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
+                    .disabled(self.preparing_deletion.is_some())
                     .text_color(rgb(TEXT))
                     .ghost()
                     .xsmall()
@@ -1259,10 +1260,7 @@ impl TreeLensApp {
     }
 
     fn show_dialog(&self, issues: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.deletion.is_some()
-            || self.preparing_deletion.is_some()
-            || window.has_active_dialog(cx)
-        {
+        if self.preparing_deletion.is_some() || window.has_active_dialog(cx) {
             return;
         }
         let records = if issues {
@@ -1343,8 +1341,10 @@ impl Render for TreeLensApp {
             }))
             .on_action(|_: &Quit, _, cx| cx.quit())
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                if let Some(path) = paths.0.first() {
-                    this.start(path.clone(), window, cx);
+                if !window.has_active_dialog(cx) {
+                    if let Some(path) = paths.0.first() {
+                        this.start(path.clone(), window, cx);
+                    }
                 }
             }))
             .child(

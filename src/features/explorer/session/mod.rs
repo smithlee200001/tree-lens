@@ -104,8 +104,9 @@ impl Session {
     /// and completions are discarded, even if already queued before the click.
     /// Same-root refreshes and post-deletion reconciliation retain their view.
     pub fn start(&mut self, path: PathBuf) -> bool {
-        if self.reconciling
-            || (self.busy() && self.root_path.as_ref() == Some(&path) && !self.cancelling())
+        if self.busy()
+            && self.root_path.as_ref() == Some(&path)
+            && (self.reconciling || !self.cancelling())
         {
             return false;
         }
@@ -125,6 +126,9 @@ impl Session {
             self.discarding_scan = true;
             self.pending_root = Some(path.clone());
         }
+        // A new destination can supersede a retained refresh too. Its
+        // completion must be discarded, not matched onto the new tree.
+        self.reconciling = false;
         self.root_path = Some(path.clone());
         self.result = None;
         self.stale = false;
@@ -332,6 +336,14 @@ impl Session {
             true
         } else {
             false
+        }
+    }
+
+    /// A cancelled scan that may have overlapped deletion is not a safe basis
+    /// for another delete. Keep its partial view until the user refreshes it.
+    pub fn retain_stale_after_deletion(&mut self) {
+        if self.result.is_some() {
+            self.reconciliation_failed("扫描已取消");
         }
     }
 

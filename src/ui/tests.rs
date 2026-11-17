@@ -273,12 +273,7 @@ fn deletion_confirmation_is_single_use_and_refreshes_selection(cx: &mut TestAppC
             assert!(app.pending_deletion.is_none());
             assert!(app.deletion.is_some());
             assert!(app.deletion_progress.is_some());
-            app.show_dialog(false, window, cx);
-            assert!(!window.has_active_dialog(cx));
             app.confirm_delete(window, cx); // repeated dispatch must do nothing
-            let generation = app.generation;
-            app.start(temp.0.clone(), window, cx); // blocked during I/O
-            assert_eq!(app.generation, generation);
             let deadline = Instant::now() + Duration::from_secs(5);
             while app.busy() && Instant::now() < deadline {
                 app.poll_deletion(window, cx);
@@ -297,6 +292,145 @@ fn deletion_confirmation_is_single_use_and_refreshes_selection(cx: &mut TestAppC
     .unwrap();
     assert!(!temp.0.join("scan/folder-to-trash").exists());
     assert!(temp.0.join("mock-trash/content.txt").is_file());
+}
+
+#[gpui_kit::test]
+fn executing_delete_leaves_other_controls_and_root_navigation_usable(cx: &mut TestAppContext) {
+    let (temp, handle, view, id) = deletion_fixture(cx, 1440.0);
+    let original = temp.0.join("scan");
+    let target = original.join("folder-to-trash");
+    let gate = temp.0.join("allow-mock-trash");
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |app, cx| {
+            app.delete_operation = |request| {
+                let gate = request
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("allow-mock-trash");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !gate.exists() {
+                    if Instant::now() >= deadline {
+                        return Err("test never released mock Trash".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                mock_trash(request)
+            };
+            app.request_delete(id, window, cx);
+        });
+        window.click("delete-confirm", cx);
+        assert!(view.read(cx).deletion.is_some());
+        assert!(target.is_dir());
+        assert!(!window.has_active_dialog(cx));
+        assert!(window.find("deletion-progress").visible());
+
+        window.click("about", cx);
+        assert!(window.has_active_dialog(cx));
+        window.press("escape", cx);
+        assert!(!window.has_active_dialog(cx));
+        assert!(view.read(cx).deletion.is_some());
+
+        let root = view.read(cx).session.result.as_ref().unwrap().root;
+        window.click_at(("row", root), point(px(85.), px(20.)), cx);
+        assert_eq!(view.read(cx).session.selected, Some(root));
+        let before = view.read(cx).session.expanded.contains(&id);
+        window.double_click(("row", id), cx);
+        assert_ne!(view.read(cx).session.expanded.contains(&id), before);
+        window.click("sort-name", cx);
+        assert_eq!(view.read(cx).session.sort, SortBy::Name);
+        view.update(cx, |app, cx| app.request_delete(id, window, cx));
+        window.click("tree-filter", cx);
+        window.input("content", cx);
+        assert_eq!(
+            view.read(cx).search_input.read(cx).value().as_ref(),
+            "content"
+        );
+        assert!(
+            !window.has_active_dialog(cx),
+            "second delete is still blocked"
+        );
+
+        window.click("refresh", cx);
+        assert!(view.read(cx).session.reconciling());
+        view.update(cx, |app, cx| {
+            app.path_input.update(cx, |input, cx| {
+                input.set_value(temp.0.display().to_string(), window, cx)
+            });
+        });
+        window.click("scan-path", cx);
+        assert_eq!(view.read(cx).session.root_path.as_ref(), Some(&temp.0));
+        assert!(!view.read(cx).session.reconciling());
+        assert!(view.read(cx).session.busy());
+        assert!(view.read(cx).deletion.is_some());
+
+        // Deliver the deletion result before the concurrent scan is polled,
+        // so the latest view must be revalidated after that scan settles.
+        std::fs::write(&gate, b"ready").unwrap();
+        view.update(cx, |app, cx| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.deletion.is_some() && Instant::now() < deadline {
+                app.poll_deletion(window, cx);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.deletion.is_none());
+            assert!(app.reconcile_after_deletion);
+            while app.busy() && Instant::now() < deadline {
+                app.poll_session(window, cx);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!app.busy());
+            assert_eq!(app.session.result.as_ref().unwrap().root_path, temp.0);
+            assert!(app.session.node_for_path(&target).is_none());
+            assert!(app
+                .session
+                .node_for_path(&temp.0.join("mock-trash"))
+                .is_some());
+            assert!(app.deletion_notice.as_ref().unwrap().contains(TRASH_NAME));
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("deletion-progress").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn cancelling_an_overlapping_scan_does_not_restart_it_after_deletion(cx: &mut TestAppContext) {
+    for deletion_finishes_first in [false, true] {
+        let (temp, handle, view, _) = trash_fixture(cx);
+        let other = temp.0.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.deletion = Some(receiver);
+                app.deletion_mode = Some(DeletionMode::Trash);
+                app.start(other.clone(), window, cx);
+                app.session.cancel();
+                sender.send(Ok(())).unwrap();
+                if deletion_finishes_first {
+                    app.poll_deletion(window, cx);
+                    assert!(app.reconcile_after_deletion);
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.session.busy() && Instant::now() < deadline {
+                    app.poll_session(window, cx);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.session.busy());
+                if !deletion_finishes_first {
+                    app.poll_deletion(window, cx);
+                }
+                assert!(!app.busy());
+                assert_eq!(app.session.result.as_ref().unwrap().root_path, other);
+                assert!(app.session.result.as_ref().unwrap().cancelled);
+                assert!(app.session.stale());
+            });
+        })
+        .unwrap();
+    }
 }
 
 #[gpui_kit::test]
@@ -523,9 +657,6 @@ fn permanent_confirmation_is_single_use_and_refreshes_file_counts(cx: &mut TestA
             assert!(app.pending_deletion.is_none());
             assert!(app.deletion.is_some());
             app.confirm_delete(window, cx);
-            let generation = app.generation;
-            app.start(temp.0.clone(), window, cx);
-            assert_eq!(app.generation, generation);
             let deadline = Instant::now() + Duration::from_secs(5);
             while app.busy() && Instant::now() < deadline {
                 app.poll_deletion(window, cx);
@@ -971,19 +1102,15 @@ fn same_root_refresh_retains_view_and_new_search_survives_duplicate_click(cx: &m
             let tiles = app.tiles.len();
             app.refresh(window, cx);
             assert!(app.session.reconciling());
-            assert!(app.navigation_blocked());
+            assert!(!app.navigation_blocked());
             assert_eq!(app.session.selected, Some(selected));
             assert_eq!(app.session.summary(), summary);
             assert_eq!(app.tiles.len(), tiles);
+            // A new destination supersedes a retained refresh immediately.
             app.start(other.clone(), window, cx);
-            assert_eq!(app.session.root_path, Some(temp.0.join("scan")));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while app.busy() && Instant::now() < deadline {
-                app.poll_session(window, cx);
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(!app.busy());
-            app.start(other.clone(), window, cx);
+            assert_eq!(app.session.root_path.as_ref(), Some(&other));
+            assert!(app.session.result.is_none());
+            assert!(!app.session.reconciling());
             app.search_input
                 .update(cx, |input, cx| input.set_value("new search", window, cx));
             app.session.set_query("new search".into());
@@ -992,6 +1119,13 @@ fn same_root_refresh_retains_view_and_new_search_survives_duplicate_click(cx: &m
             assert_eq!(app.generation, generation);
             assert_eq!(app.search_input.read(cx).value().as_ref(), "new search");
             assert_eq!(app.session.query, "new search");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.busy() && Instant::now() < deadline {
+                app.poll_session(window, cx);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!app.busy());
+            assert_eq!(app.session.result.as_ref().unwrap().root_path, other);
         });
     })
     .unwrap();

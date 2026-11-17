@@ -200,6 +200,23 @@ fn lifecycle(
         "pending deletion must preserve refresh bounds"
     );
     capture("confirm-pending", window, cx);
+    // The modal previously blocked wheel input at this same exposed point;
+    // the live progress surface must not do so.
+    window.dispatch_event(
+        ScrollEvent {
+            position: exposed,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            ..Default::default()
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+    assert_ne!(
+        view.read(cx).scroll.0.borrow().base_handle.offset(),
+        scroll_before,
+        "wheel input must scroll during deletion"
+    );
     settled(window, cx);
     capture("pending-settled", window, cx);
     let deadline = Instant::now() + Duration::from_secs(5);
